@@ -7,8 +7,9 @@ const Uri = std.Uri;
 const http = std.http;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
+const sort = std.sort;
 
-const mime_types = std.ComptimeStringMap([]const u8, .{
+const mime_types = std.StaticStringMap([]const u8).initComptime(.{
     .{ ".html", "text/html" },
     .{ ".htm", "text/html" },
     .{ ".css", "text/css" },
@@ -34,20 +35,20 @@ fn parsePort(args: [][]u8) !u16 {
     return port;
 }
 
-fn handleConnection(allocator: Allocator, conn: net.Server.Connection) !void {
+fn handleConnection(allocator: Allocator, conn: net.Server.Connection) void {
     defer conn.stream.close();
     var read_buffer: [8192]u8 = undefined;
     var server = http.Server.init(conn, &read_buffer);
 
     while (true) {
-        const request = server.receiveHead() catch |err| {
+        var request = server.receiveHead() catch |err| {
             std.log.err("Failed to receive head: {}", .{err});
             return;
         };
 
-        std.debug.print("{} {}\n", .{ request.method, request.target });
+        std.debug.print("{} {s}\n", .{ request.head.method, request.head.target });
 
-        handleRequest(allocator, &server, &request) catch |err| {
+        handleRequest(allocator, &request) catch |err| {
             std.log.err("Failed to handle request: {}", .{err});
             return;
         };
@@ -81,8 +82,9 @@ fn generateDirectoryListing(allocator: Allocator, dir_path: []const u8, uri_path
         try entries.append(.{ .name = name, .is_dir = is_dir });
     }
 
-    std.sort.sort(@TypeOf(entries.items[0]), entries.items, {}, struct {
+    sort.block(@TypeOf(entries.items[0]), entries.items, {}, struct {
         fn lessThan(_: void, a: @TypeOf(entries.items[0]), b: @TypeOf(entries.items[0])) bool {
+            // directories first, then lexicographically
             if (a.is_dir and !b.is_dir) return true;
             if (!a.is_dir and b.is_dir) return false;
             return mem.lessThan(u8, a.name, b.name);
@@ -115,17 +117,17 @@ fn generateDirectoryListing(allocator: Allocator, dir_path: []const u8, uri_path
     return html.toOwnedSlice();
 }
 
-fn handleRequest(allocator: Allocator, server: *http.Server, request: *http.Server.Request) !void {
-    if (request.method != .GET) {
-        try sendError(allocator, server, request, .method_not_allowed, "Method Not Allowed");
+fn handleRequest(allocator: Allocator, request: *http.Server.Request) !void {
+    if (request.head.method != .GET) {
+        try sendError(allocator, request, .method_not_allowed, "Method Not Allowed");
         return;
     }
 
     const root_path = try fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
 
-    const uri = try Uri.parse(request.target);
-    const decoded_path = try percentDecode(allocator, uri.path);
+    const uri = try Uri.parse(request.head.target);
+    const decoded_path = try percentDecode(allocator, uri.path.percent_encoded);
     defer allocator.free(decoded_path);
 
     const resolved_path = try resolveRequestPath(allocator, root_path, decoded_path);
@@ -149,11 +151,12 @@ fn handleRequest(allocator: Allocator, server: *http.Server, request: *http.Serv
 
             if (fs.openFileAbsolute(index_path, .{})) |index_file| {
                 defer index_file.close();
-                try sendFile(allocator, server, request, index_path, "text/html");
+                try sendFile(allocator, request, index_path, "text/html");
             } else |_| {
-                const html = try generateDirectoryListing(allocator, resolved_path, uri.path);
+                const uri_path = try uri.path.toRawMaybeAlloc(allocator);
+                const html = try generateDirectoryListing(allocator, resolved_path, uri_path);
                 defer allocator.free(html);
-                try sendResponse(server, request, .ok, "text/html", html);
+                try sendResponse(request, .ok, "text/html", html);
             }
             return;
         },
@@ -168,21 +171,21 @@ fn handleRequest(allocator: Allocator, server: *http.Server, request: *http.Serv
 
         if (fs.openFileAbsolute(index_path, .{})) |index_file| {
             defer index_file.close();
-            try sendFile(allocator, server, request, index_path, "text/html");
+            try sendFile(allocator, request, index_path, "text/html");
         } else |_| {
-            const html = try generateDirectoryListing(allocator, resolved_path, uri.path);
+            const uri_path = try uri.path.toRawMaybeAlloc(allocator);
+            const html = try generateDirectoryListing(allocator, resolved_path, uri_path);
             defer allocator.free(html);
-            try sendResponse(server, request, .ok, "text/html", html);
+            try sendResponse(request, .ok, "text/html", html);
         }
     } else {
         const ext = fs.path.extension(resolved_path);
         const mime_type = mime_types.get(ext) orelse "application/octet-stream";
-        try sendFile(allocator, server, request, resolved_path, mime_type);
+        try sendFile(allocator, request, resolved_path, mime_type);
     }
 }
 
 fn sendResponse(
-    server: *http.Server,
     request: *http.Server.Request,
     status: http.Status,
     content_type: []const u8,
@@ -192,18 +195,14 @@ fn sendResponse(
         .name = "Content-Type",
         .value = content_type,
     }};
-    var response = try server.respond(request, .{
+    try request.respond(body, .{
         .status = status,
-        .headers = &headers,
-        .transfer_encoding = .{ .content_length = body.len },
+        .extra_headers = &headers,
     });
-    try response.writeAll(body);
-    try response.finish();
 }
 
 fn sendFile(
     allocator: Allocator,
-    server: *http.Server,
     request: *http.Server.Request,
     path: []const u8,
     mime_type: []const u8,
@@ -214,19 +213,18 @@ fn sendFile(
     const content = try allocator.alloc(u8, stat.size);
     defer allocator.free(content);
     _ = try file.readAll(content);
-    try sendResponse(server, request, .ok, mime_type, content);
+    try sendResponse(request, .ok, mime_type, content);
 }
 
 fn sendError(
     allocator: Allocator,
-    server: *http.Server,
     request: *http.Server.Request,
     status: http.Status,
     message: []const u8,
 ) !void {
     const body = try fmt.allocPrint(allocator, "{}: {s}", .{ status, message });
     defer allocator.free(body);
-    try sendResponse(server, request, status, "text/plain", body);
+    try sendResponse(request, status, "text/plain", body);
 }
 
 fn percentDecode(allocator: Allocator, path: []const u8) ![]u8 {
@@ -255,13 +253,27 @@ pub fn main() !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const raw_args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, raw_args);
 
-    const port = try parsePort(args);
+    var args_list = std.ArrayList([]u8).init(allocator);
+    defer args_list.deinit();
+
+    const zero: [1]u8 = [_]u8{0};
+    for (raw_args) |zstr| {
+        // find the length up to—but not including—the first zero
+        const len = std.mem.indexOf(u8, zstr, zero[0..]) orelse zstr.len;
+        try args_list.append(zstr[0..len]);
+    }
+
+    const port = try parsePort(try args_list.toOwnedSlice());
     const address = try net.Address.resolveIp("0.0.0.0", port);
-    var tcp_server = net.Server.init(.{ .reuse_address = true });
-    try tcp_server.listen(address);
+
+    const listen_opts = net.Address.ListenOptions{
+        .reuse_address = true,
+    };
+
+    var tcp_server = try address.listen(listen_opts);
 
     var thread_pool: Thread.Pool = undefined;
     try thread_pool.init(.{ .allocator = allocator });
