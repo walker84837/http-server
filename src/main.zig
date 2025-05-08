@@ -8,7 +8,20 @@ const http = std.http;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 
-fn parsePort(args: [][]const u8) !u16 {
+const mime_types = std.ComptimeStringMap([]const u8, .{
+    .{ ".html", "text/html" },
+    .{ ".htm", "text/html" },
+    .{ ".css", "text/css" },
+    .{ ".js", "application/javascript" },
+    .{ ".png", "image/png" },
+    .{ ".jpg", "image/jpeg" },
+    .{ ".jpeg", "image/jpeg" },
+    .{ ".gif", "image/gif" },
+    .{ ".txt", "text/plain" },
+    .{ ".json", "application/json" },
+});
+
+fn parsePort(args: [][]u8) !u16 {
     var port: u16 = 8080;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -21,22 +34,19 @@ fn parsePort(args: [][]const u8) !u16 {
     return port;
 }
 
-fn handleConnection(allocator: Allocator, conn: net.StreamServer.Connection) !void {
+fn handleConnection(allocator: Allocator, conn: net.Server.Connection) !void {
     defer conn.stream.close();
     var read_buffer: [8192]u8 = undefined;
     var server = http.Server.init(conn, &read_buffer);
 
     while (true) {
-        server.receiveHead() catch |err| {
+        const request = server.receiveHead() catch |err| {
             std.log.err("Failed to receive head: {}", .{err});
             return;
         };
-        const request = server.request;
 
-        // Log to stderr
         std.debug.print("{} {}\n", .{ request.method, request.target });
 
-        // Handle the request
         handleRequest(allocator, &server, &request) catch |err| {
             std.log.err("Failed to handle request: {}", .{err});
             return;
@@ -71,7 +81,6 @@ fn generateDirectoryListing(allocator: Allocator, dir_path: []const u8, uri_path
         try entries.append(.{ .name = name, .is_dir = is_dir });
     }
 
-    // Sort directories first
     std.sort.sort(@TypeOf(entries.items[0]), entries.items, {}, struct {
         fn lessThan(_: void, a: @TypeOf(entries.items[0]), b: @TypeOf(entries.items[0])) bool {
             if (a.is_dir and !b.is_dir) return true;
@@ -81,7 +90,6 @@ fn generateDirectoryListing(allocator: Allocator, dir_path: []const u8, uri_path
     }.lessThan);
 
     var html = std.ArrayList(u8).init(allocator);
-    defer html.deinit();
     try html.writer().print(
         \\<!DOCTYPE html>
         \\<html>
@@ -124,8 +132,29 @@ fn handleRequest(allocator: Allocator, server: *http.Server, request: *http.Serv
     defer allocator.free(resolved_path);
 
     const file = fs.openFileAbsolute(resolved_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => {
-            try sendError(allocator, server, request, .not_found, "Not Found");
+        error.FileNotFound, error.IsDir => {
+            // const dir_stat = (fs.openDirAbsolute(resolved_path, .{}) catch |e| {
+            //     if (e == error.NotDir) {
+            //         try sendError(allocator, server, request, .not_found, "Not Found");
+            //         return;
+            //     }
+            //     return e;
+            // }).stat() catch {
+            //     try sendError(allocator, server, request, .not_found, "Not Found");
+            //     return;
+            // };
+
+            const index_path = try fs.path.join(allocator, &.{ resolved_path, "index.html" });
+            defer allocator.free(index_path);
+
+            if (fs.openFileAbsolute(index_path, .{})) |index_file| {
+                defer index_file.close();
+                try sendFile(allocator, server, request, index_path, "text/html");
+            } else |_| {
+                const html = try generateDirectoryListing(allocator, resolved_path, uri.path);
+                defer allocator.free(html);
+                try sendResponse(server, request, .ok, "text/html", html);
+            }
             return;
         },
         else => return err,
@@ -134,19 +163,20 @@ fn handleRequest(allocator: Allocator, server: *http.Server, request: *http.Serv
 
     const stat = try file.stat();
     if (stat.kind == .directory) {
-        const index_path = try fs.path.join(allocator, &[_][]const u8{ resolved_path, "index.html" });
+        const index_path = try fs.path.join(allocator, &.{ resolved_path, "index.html" });
         defer allocator.free(index_path);
 
         if (fs.openFileAbsolute(index_path, .{})) |index_file| {
-            index_file.close();
+            defer index_file.close();
             try sendFile(allocator, server, request, index_path, "text/html");
         } else |_| {
             const html = try generateDirectoryListing(allocator, resolved_path, uri.path);
             defer allocator.free(html);
-            try sendResponse(allocator, server, request, .ok, "text/html", html);
+            try sendResponse(server, request, .ok, "text/html", html);
         }
     } else {
-        const mime_type = try getMimeType(resolved_path);
+        const ext = fs.path.extension(resolved_path);
+        const mime_type = mime_types.get(ext) orelse "application/octet-stream";
         try sendFile(allocator, server, request, resolved_path, mime_type);
     }
 }
@@ -158,9 +188,10 @@ fn sendResponse(
     content_type: []const u8,
     body: []const u8,
 ) !void {
-    const headers = [_]http.Header{
-        .{ .name = "Content-Type", .value = content_type },
-    };
+    const headers = [_]http.Header{.{
+        .name = "Content-Type",
+        .value = content_type,
+    }};
     var response = try server.respond(request, .{
         .status = status,
         .headers = &headers,
@@ -183,7 +214,7 @@ fn sendFile(
     const content = try allocator.alloc(u8, stat.size);
     defer allocator.free(content);
     _ = try file.readAll(content);
-    try sendResponse(allocator, server, request, .ok, mime_type, content);
+    try sendResponse(server, request, .ok, mime_type, content);
 }
 
 fn sendError(
@@ -195,15 +226,20 @@ fn sendError(
 ) !void {
     const body = try fmt.allocPrint(allocator, "{}: {s}", .{ status, message });
     defer allocator.free(body);
-    try sendResponse(allocator, server, request, status, "text/plain", body);
+    try sendResponse(server, request, status, "text/plain", body);
 }
 
 fn percentDecode(allocator: Allocator, path: []const u8) ![]u8 {
     var list = std.ArrayList(u8).init(allocator);
+    defer list.deinit();
     var i: usize = 0;
     while (i < path.len) {
         if (path[i] == '%' and i + 2 < path.len) {
-            const byte = try fmt.parseInt(u8, path[i + 1 .. i + 3], 16);
+            const byte = fmt.parseInt(u8, path[i + 1 .. i + 3], 16) catch {
+                try list.append(path[i]);
+                i += 1;
+                continue;
+            };
             try list.append(byte);
             i += 3;
         } else {
@@ -212,22 +248,6 @@ fn percentDecode(allocator: Allocator, path: []const u8) ![]u8 {
         }
     }
     return list.toOwnedSlice();
-}
-
-fn getMimeType(allocator: Allocator, path: []const u8) ![]const u8 {
-    const ext = fs.path.extension(path);
-    const mimeAssociations = std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator);
-    defer mimeAssociations.deinit();
-    try mimeAssociations.put(".html", "text/html");
-    try mimeAssociations.put(".css", "text/css");
-    try mimeAssociations.put(".js", "application/javascript");
-    try mimeAssociations.put(".png", "image/png");
-    try mimeAssociations.put(".jpg", "image/jpeg");
-    try mimeAssociations.put(".jpeg", "image/jpeg");
-    try mimeAssociations.put(".gif", "image/gif");
-    try mimeAssociations.put(".txt", "text/plain");
-
-    return mimeAssociations.get(ext) orelse "application/octet-stream";
 }
 
 pub fn main() !void {
@@ -240,14 +260,17 @@ pub fn main() !void {
 
     const port = try parsePort(args);
     const address = try net.Address.resolveIp("0.0.0.0", port);
-    var server = net.StreamServer.init(.{});
-    try server.listen(address);
+    var tcp_server = net.Server.init(.{ .reuse_address = true });
+    try tcp_server.listen(address);
+
+    var thread_pool: Thread.Pool = undefined;
+    try thread_pool.init(.{ .allocator = allocator });
+    defer thread_pool.deinit();
 
     std.debug.print("Server running on port {}\n", .{port});
 
     while (true) {
-        const conn = try server.accept();
-        const handle = try Thread.spawn(.{}, handleConnection, .{ allocator, conn });
-        handle.detach();
+        const conn = try tcp_server.accept();
+        try thread_pool.spawn(handleConnection, .{ allocator, conn });
     }
 }
